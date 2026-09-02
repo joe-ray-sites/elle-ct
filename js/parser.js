@@ -1,26 +1,45 @@
 // Turns raw ACT text (from a PDF, a paste, a scan-to-text) into structured questions.
 // Deliberately forgiving: PDF text extraction is messy, so every rule has a fallback.
+//
+// Two modes fall out of the same pass:
+//  · booklet mode — the text contains real section headers (ENGLISH TEST …).
+//    Subjects come from the headers, numbering restarts per section, passage
+//    text is only accepted under an explicit PASSAGE header, and the scoring
+//    keys / conversion table printed at the back are parsed too.
+//  · loose mode — anything pasted by hand. Subject is guessed per question and
+//    any long block of text before question 1 is treated as a passage.
+//
+// Page markers (⟪PAGE n⟫) are inserted by the PDF extractor. They let every
+// question and passage remember which page it came from, so the rendered page
+// image (with the figures text extraction loses) can be shown alongside.
 
 const LETTERS = 'ABCDEFGHJK';
+const SET_A = 'ABCDE', SET_F = 'FGHJK';
 const JUNK = [
   /^\s*go on to the next page/i,
   /^\s*do your figuring here/i,
   /^\s*end of test/i,
   /^\s*stop!? if you finish/i,
-  /^\s*act[-–]?\s?\d{2,4}[a-z]?\s*$/i,
-  /^\s*\d{1,3}\s*$/,                      // stray page numbers
+  /^\s*act[-–]?\s?[a-z]?\d{2,4}[a-z]?\s*$/i,   // form codes: ACT-1874C, ACT-J04
+  /^\s*\d{1,3}\s*$/,                          // stray page / line numbers
   /^\s*(page\s+)?\d{1,3}\s*\|\s*/i,
   /^\s*copyright|^\s*©/i,
 ];
 
 const isJunk = (line) => JUNK.some(re => re.test(line));
+const PAGE_MARK = /^\s*⟪PAGE (\d+)⟫\s*$/;
+const SECTION = /^\s*(ENGLISH|MATHEMATICS|MATH|READING|SCIENCE|WRITING)\s+TEST\b/i;
+const STOP = /^\s*(scoring guide|scoring key|.*scoring key \(for form|conversion of raw scores)/i;
 const QSTART = /^\s{0,6}\(?(\d{1,3})\s*[.):]\s+(\S.*)$/;
 const CHOICE = /^\s{0,8}\(?([A-K])\s*[.):]\s*(.*)$/;
 const CHOICE_INLINE = /\(?\b([A-K])[.)]\s+/g;
 const PASSAGE_HEAD = /^\s*(passage\s+[ivx\d]+[a-z]?)\b(.*)$/i;
+const PARA_MARK = /^\s*\[(\d{1,2}|[A-H])\]\s*$/;     // English paragraph / point markers
 const KEY_PAIR = /(\d{1,3})\s*[.):\-–]?\s*([A-K])\b/g;
 
 const clean = (s) => s.replace(/[ \t]+/g, ' ').replace(/\s+\n/g, '\n').trim();
+
+const SUBJECT_OF = { ENGLISH: 'English', MATHEMATICS: 'Math', MATH: 'Math', READING: 'Reading', SCIENCE: 'Science', WRITING: 'Writing' };
 
 function normalize(raw) {
   return raw
@@ -28,11 +47,23 @@ function normalize(raw) {
     .replace(/\f/g, '\n')
     .replace(/[‘’]/g, "'")
     .replace(/[“”]/g, '"')
-    .replace(/ /g, ' ')
+    .replace(/ /g, ' ')
     .replace(/-\n(?=[a-z])/g, '')          // de-hyphenate line-broken words
     .split('\n')
     .filter(l => !isJunk(l))
     .join('\n');
+}
+
+/** Figure debris: axis numbers, single labels, "Key", "Figure 2". Only judged
+ *  inside a question or a booklet passage — the page image carries the figure. */
+function isDebris(line) {
+  const t = line.trim();
+  if (!t) return true;
+  if (t.length <= 2) return true;
+  if (/^[\d\s.,°%()\-−–+×÷=<>/:]+$/.test(t)) return true;          // numbers & math punct only
+  if (t.length <= 8 && !/[a-z]/.test(t)) return true;                // "RO (%)", "Q", "MDL"
+  if (/^(key|day|trial \d+|figure \d+|table \d+|study \d+|experiment \d+)$/i.test(t)) return true;
+  return false;
 }
 
 /** Answer key: "1. A  2. J  3. C" in any layout, including a column per line. */
@@ -68,19 +99,92 @@ export function parseExplanations(text) {
   return out;
 }
 
+// ---------------------------------------------------------- booklet keys
+/** ACT's printed reporting-category codes → readable tags. */
+const CATEGORY = {
+  POW: 'production-of-writing', KLA: 'knowledge-of-language', CSE: 'conventions-of-standard-english',
+  'PHM-A': 'algebra', 'PHM-F': 'functions', 'PHM-G': 'geometry', 'PHM-N': 'number-quantity',
+  'PHM-S': 'statistics-probability', IES: 'essential-skills', MDL: 'modeling',
+  KID: 'key-ideas-details', CS: 'craft-structure', IKI: 'integration-knowledge-ideas',
+  IOD: 'interpretation-of-data', SIN: 'scientific-investigation', EMI: 'evaluation-models-inferences',
+};
+
+/**
+ * Scoring keys printed at the back of an ACT booklet. Each section is a
+ * column of rows: number, letter, optional "(Mark 1)", then category codes.
+ * Returns { English: Map(number → {answer, tags}), Math: …, … }.
+ */
+export function parseBookletKeys(text) {
+  const out = {};
+  const re = /^\s*(English|Mathematics|Math|Reading|Science)\s+Scoring Key\b.*$/gim;
+  const starts = [];
+  let m;
+  while ((m = re.exec(text)) !== null) starts.push({ subject: SUBJECT_OF[m[1].toUpperCase()], at: m.index });
+  // A row is "number letter categories". Different extractors put the three
+  // on one line or on three, so whitespace here may span newlines; the
+  // strictly sequential numbering is what keeps "of 17 / Conventions" out.
+  const ROW = /(?:^|\s)(\d{1,2})\s+([A-K])\s+([A-Z][A-Z\-]*(?:\s*,\s*[A-Z][A-Z\-]*)*)(?=\s|$)/g;
+  for (let i = 0; i < starts.length; i++) {
+    const seg = text.slice(starts[i].at, starts[i + 1]?.at ?? text.length).replace(/\(mark 1\)/gi, ' ');
+    const map = new Map();
+    let expect = 1, r;
+    ROW.lastIndex = 0;
+    while ((r = ROW.exec(seg)) !== null) {
+      if (parseInt(r[1], 10) !== expect) continue;
+      const tags = r[3].split(/\s*,\s*/).map(c => CATEGORY[c] || c.toLowerCase()).filter(Boolean);
+      map.set(expect, { answer: r[2], tags });
+      expect++;
+    }
+    if (map.size) out[starts[i].subject] = map;
+  }
+  return out;
+}
+
+/**
+ * The form-specific "Conversion of Raw Scores to Scale Scores" table: five
+ * tokens per row — scale, then raw (or range, or —) for E / M / R / S.
+ * Returns { English: [[rawNeeded, scale] …], …, items: {English: 40, …} }.
+ */
+export function parseConversion(text) {
+  // The table's own title carries "(for Form …)"; the prose on the page before
+  // mentions the table by name too, so prefer the title and fall back to the
+  // last mention.
+  let i = text.search(/conversion of raw scores\s+to\s+scale scores\s*\(for form/i);
+  if (i < 0) i = text.toLowerCase().lastIndexOf('conversion of raw scores');
+  if (i < 0) return null;
+  // Whitespace-tokenised so one-cell-per-line and one-row-per-line layouts read the same.
+  const toks = text.slice(i).split(/\s+/).filter(Boolean);
+  const start = toks.indexOf('36');
+  if (start < 0) return null;
+  const sections = ['English', 'Math', 'Reading', 'Science'];
+  const table = { English: [], Math: [], Reading: [], Science: [] };
+  const items = {};
+  let expect = 36;
+  for (let p = start; p + 4 < toks.length && expect >= 1; p += 5) {
+    if (toks[p] !== String(expect)) break;
+    sections.forEach((s, k) => {
+      const r = toks[p + 1 + k].match(/^(\d{1,2})(?:[–\-](\d{1,2}))?$/);
+      if (!r) return;
+      const lo = parseInt(r[1], 10), hi = r[2] ? parseInt(r[2], 10) : lo;
+      table[s].push([lo, expect]);
+      items[s] = Math.max(items[s] || 0, hi);
+    });
+    expect--;
+  }
+  if (!Object.keys(items).length) return null;
+  return { ...table, items };
+}
+
+// ------------------------------------------------------------ subjects
 function guessSubject(q, passageText = '') {
   const stem = (q.stem || '').toLowerCase();
   const all = (stem + ' ' + q.choices.map(c => c.text).join(' ')).toLowerCase();
   const ctx = passageText.toLowerCase();
-  // English gives itself away either in the choices (NO CHANGE) or in the
-  // rhetorical wording of the stem — check both before anything else.
   if (/no change/.test(all) || /omit the underlined/.test(all)) return 'English';
   if (/the writer|the essay|this paragraph|the preceding sentence|underlined portion/.test(stem)) return 'English';
   if (q.choices.length === 5) return 'Math';
   if (/which of the following|solve|equation|graph|triangle|\bx\s*=|integer|slope/.test(stem)
       && /[0-9=+\-*/^√π]/.test(q.choices.map(c => c.text).join(''))) return 'Math';
-  // Science terms must appear in the question itself; a passage that merely
-  // mentions a "table" is not a Science passage.
   if (/figure \d|table \d|trial \d|study \d|experiment \d|scientist \d|according to (figure|table)|data in/.test(stem)) return 'Science';
   if (/\b(figure|table|trial|hypothesis)\b/.test(stem) && /(figure|table|trial|experiment) \d/.test(ctx)) return 'Science';
   if (/passage|the author|the narrator|main idea|it can reasonably be inferred|as it is used in line/.test(stem)) return 'Reading';
@@ -98,7 +202,6 @@ export function autoTags(q, subject) {
     if (/should (the writer|this|that)|if the writer were to delete|essay/.test(s)) t.add('author-purpose');
     if (/most logical place|placement|sentence \d/.test(s)) t.add('organization');
     if (/redundant|wordy|concise/.test(s)) t.add('conciseness');
-    // Only tag agreement/tense when the choices actually swap verb forms.
     const texts = q.choices.map(c => c.text.toLowerCase());
     const pairs = [['was','were'],['is','are'],['has','have'],['had','has'],['does','do'],['their','its']];
     if (pairs.some(([a, b]) => texts.some(t1 => new RegExp(`\\b${a}\\b`).test(t1)) &&
@@ -107,7 +210,7 @@ export function autoTags(q, subject) {
   } else if (subject === 'Math') {
     if (/triangle|angle|circle|radius|perimeter|area|parallel|degrees/.test(s)) t.add('geometry');
     if (/slope|line|coordinate|\(x, ?y\)|graph/.test(s)) t.add('coordinate-geometry');
-    if (/probability|average|mean|median|mode|ratio|percent/.test(s)) t.add('stats-probability');
+    if (/probability|average|mean|median|mode|ratio|percent/.test(s)) t.add('statistics-probability');
     if (/sin|cos|tan|trig/.test(s)) t.add('trigonometry');
     if (/equation|solve for|expression|factor|inequality|x\^?2|quadratic/.test(s)) t.add('algebra');
     if (/matrix|imaginary|logarithm|vector|sequence/.test(s)) t.add('advanced');
@@ -128,108 +231,166 @@ export function autoTags(q, subject) {
   return [...t];
 }
 
+// ---------------------------------------------------------- main parse
 /**
- * Main entry. Returns { questions, passages, prompts, warnings }.
+ * Returns { questions, passages, prompts, warnings, keys, conversion, booklet }.
  * Numbers restart per section, so a detected "1." after "60." is treated as a new section.
  */
 export function parseTest(raw, opts = {}) {
   const text = normalize(raw || '');
   const lines = text.split('\n');
   const warnings = [];
-
-  // Writing prompt? Those have no choices at all.
   const promptHit = /write a unified, coherent essay|essay task|perspective (one|1)\b/i.test(text);
 
   const passages = [];
   const questions = [];
-  let curPassage = null;
-  let passageBuf = [];
-  let cur = null;         // question under construction
+  let booklet = false;          // saw a real section header
+  let stop = false;             // reached the scoring pages at the back
+  let section = null;           // subject from the current section header
+  let page = null;
+  let curPassage = null;        // { label, parts, pages, idx|null }
+  let cur = null;               // question under construction
   let lastNum = 0;
-  let preBuf = [];        // text seen before the first question of a passage
 
-  const flushPassage = () => {
-    if (!passageBuf.length) return;
-    const body = clean(passageBuf.join('\n'));
-    if (body.length > 220) {                       // ignore stray fragments
-      curPassage = { id: null, label: curPassage?.label || `Passage ${passages.length + 1}`, text: body };
-      passages.push(curPassage);
+  const finalizePassage = () => {
+    if (!curPassage) return;
+    if (curPassage.idx == null) {
+      const body = clean(curPassage.parts.join('\n'));
+      const keep = booklet ? body.length > 40 : body.length > 220;
+      if (keep) {
+        curPassage.idx = passages.length;
+        passages.push({ label: curPassage.label, text: body, pages: [...curPassage.pages].filter(Boolean) });
+      }
+    } else {
+      // English passages continue after their first questions — extend in place.
+      const p = passages[curPassage.idx];
+      p.text = clean(curPassage.parts.join('\n'));
+      p.pages = [...curPassage.pages].filter(Boolean);
     }
-    passageBuf = [];
   };
 
   const flushQuestion = () => {
     if (!cur) return;
     cur.stem = clean(cur.stemLines.join(' '));
-    cur.choices = cur.choices.filter(c => c.text.trim().length || c.letter);
     if (cur.stem && cur.choices.length >= 2) questions.push(cur);
     else if (cur.stem) warnings.push(`Question ${cur.number} had no answer choices — skipped.`);
     cur = null;
   };
 
+  // A question starts when its number follows on from the last one (a gap of
+  // a couple is tolerated for anything we failed to parse) and a choice line
+  // shows up before the next, HIGHER question number. Lower numbers in the
+  // lookahead are list items inside the stem ("1. Pack soil in the box.") or
+  // fraction fragments ("24 . Which of") and must not abort the search. The
+  // window is long because a stem can be followed by a whole data table.
   const looksLikeQuestionStart = (i, num) => {
-    // Must have a choice line within the next handful of lines, and the number
-    // must advance (or restart a section).
-    if (!(num > lastNum || num === 1)) return false;
-    for (let j = i + 1; j < Math.min(i + 14, lines.length); j++) {
+    const next = num === lastNum + 1 || (num > lastNum && num - lastNum <= 3);
+    const restart = num === 1 && (lastNum === 0 || lastNum >= 20);
+    if (!next && !restart) return false;
+    for (let j = i + 1; j < Math.min(i + 60, lines.length); j++) {
       if (CHOICE.test(lines[j])) return true;
-      if (QSTART.test(lines[j])) return false;
+      const q2 = lines[j].match(QSTART);
+      if (q2 && parseInt(q2[1], 10) > num) return false;
+      if (SECTION.test(lines[j]) || PAGE_MARK.test(lines[j])) return false;
     }
     return false;
   };
 
+  // Lines that repeat verbatim on the same page are figure legends and axis
+  // labels ("8 weeks", "age when fin"), not prose — the page image has them.
+  const repeats = new Map();
+  {
+    let pg = 0, counts = null;
+    for (const l of lines) {
+      const pm = l.match(PAGE_MARK);
+      if (pm) { pg = parseInt(pm[1], 10); counts = new Map(); repeats.set(pg, counts); continue; }
+      const t = l.trim();
+      if (counts && t && t.length < 40) counts.set(t, (counts.get(t) || 0) + 1);
+    }
+  }
+  const isLegend = (line) => (repeats.get(page)?.get(line.trim()) || 0) >= 2 && !CHOICE.test(line);
+
+  const passageLine = (line) => {
+    if (!curPassage) {
+      if (booklet) return;                       // directions & cover junk
+      curPassage = { label: null, parts: [], pages: new Set([page]), idx: null };
+    }
+    if (booklet && (isDebris(line) || isLegend(line)) && !PARA_MARK.test(line)) return;
+    curPassage.parts.push(line);
+    curPassage.pages.add(page);
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (!line.trim()) { if (cur) cur.stemLines.push(''); else passageBuf.push(''); continue; }
 
-    const ph = line.match(PASSAGE_HEAD);
-    if (ph && !cur) {
-      flushQuestion(); flushPassage();
-      curPassage = { label: clean(ph[1] + ' ' + (ph[2] || '')) };
-      passageBuf = [];
-      lastNum = 0;
+    const pm = line.match(PAGE_MARK);
+    if (pm) { flushQuestion(); page = parseInt(pm[1], 10); continue; }
+
+    if (!line.trim()) { if (cur) cur.stemLines.push(''); else if (curPassage) curPassage.parts.push(''); continue; }
+
+    const sec = line.match(SECTION);
+    if (sec && !cur) {
+      flushQuestion(); finalizePassage();
+      if (!booklet) { passages.length = 0; questions.length = 0; }   // cover pages
+      booklet = true; section = SUBJECT_OF[sec[1].toUpperCase()];
+      curPassage = null; lastNum = 0; stop = false;
       continue;
     }
+    if (booklet && STOP.test(line)) { flushQuestion(); finalizePassage(); curPassage = null; stop = true; continue; }
+    if (stop) continue;
+
+    const ph = line.match(PASSAGE_HEAD);
+    const headerAlone = ph && !clean(ph[2] || '').replace(/^[:.—\-]+/, '');
+    if (ph && (!cur || headerAlone)) {
+      flushQuestion(); finalizePassage();
+      curPassage = { label: clean(ph[1] + ' ' + (ph[2] || '')), parts: [], pages: new Set([page]), idx: null };
+      continue;
+    }
+
+    // An English paragraph marker after a question's choices means the
+    // passage has resumed in the left column.
+    if (cur && cur.choices.length >= 2 && PARA_MARK.test(line)) { flushQuestion(); passageLine(line); continue; }
 
     const qs = line.match(QSTART);
     if (qs && looksLikeQuestionStart(i, parseInt(qs[1], 10))) {
       flushQuestion();
-      if (passageBuf.length) flushPassage();
+      finalizePassage();
       lastNum = parseInt(qs[1], 10);
       cur = {
-        number: lastNum,
-        stemLines: [qs[2]],
-        choices: [],
-        passageIdx: passages.length ? passages.length - 1 : null,
+        number: lastNum, stemLines: [qs[2]], choices: [], page,
+        section, passageIdx: curPassage && curPassage.idx != null ? curPassage.idx : null,
       };
       continue;
     }
 
-    const ch = line.match(CHOICE);
-    if (cur && ch && LETTERS.includes(ch[1])) {
+    const ch = cur && line.match(CHOICE);
+    if (ch && LETTERS.includes(ch[1])) {
       const letter = ch[1];
+      const first = cur.choices[0]?.letter;
+      const sameSet = !first || (SET_A.includes(first) === SET_A.includes(letter));
       const already = cur.choices.some(c => c.letter === letter);
-      if (!already) { cur.choices.push({ letter, text: clean(ch[2]) }); continue; }
+      if (sameSet && !already) { cur.choices.push({ letter, text: clean(ch[2]) }); continue; }
+      if (!ch[2].trim()) continue;                // stray figure marker ("H. ")
+      // otherwise fall through and treat as continuation text
     }
 
     if (cur) {
-      // continuation of the last choice, or of the stem
+      if (booklet && (isDebris(line) || isLegend(line))) continue;
       if (cur.choices.length) cur.choices[cur.choices.length - 1].text = clean(cur.choices.at(-1).text + ' ' + line);
       else cur.stemLines.push(line);
     } else {
-      passageBuf.push(line);
+      passageLine(line);
     }
   }
   flushQuestion();
-  if (passageBuf.length && !questions.length) preBuf = passageBuf;
-  else flushPassage();
+  finalizePassage();
 
   // Second pass: choices crammed onto one line ("A. NO CHANGE B. having ran C. ...")
   for (const q of questions) {
     if (q.choices.length >= 2) continue;
-    const line = q.stem;
-    const hits = [...line.matchAll(CHOICE_INLINE)];
+    const hits = [...q.stem.matchAll(CHOICE_INLINE)];
     if (hits.length >= 3) {
+      const line = q.stem;
       q.stem = clean(line.slice(0, hits[0].index));
       q.choices = hits.map((h, k) => ({
         letter: h[1],
@@ -238,47 +399,65 @@ export function parseTest(raw, opts = {}) {
     }
   }
 
-  // Finish: subject, tags, passage links
   const forced = opts.subject && opts.subject !== 'auto' ? opts.subject : null;
   const out = questions
     .filter(q => q.choices.length >= 2)
     .map(q => {
       const ptext = q.passageIdx != null && passages[q.passageIdx] ? passages[q.passageIdx].text : '';
-      const subject = forced || guessSubject(q, ptext);
+      const subject = forced || q.section || guessSubject(q, ptext);
       return {
-        number: q.number,
-        stem: q.stem,
-        choices: q.choices,
-        subject,
-        passageIdx: q.passageIdx,
+        number: q.number, stem: q.stem, choices: q.choices, subject,
+        passageIdx: q.passageIdx, page: q.page,
         tags: [...new Set([...(opts.tags || []), ...autoTags(q, subject)])],
-        answer: null,
-        explanation: '',
+        answer: null, explanation: '',
       };
     });
 
-  // Writing prompt fallback: no questions found but essay language present
   const prompts = [];
-  if (promptHit && out.length === 0) {
-    prompts.push({ title: opts.source || 'Writing prompt', text: clean(text) });
-  }
+  if (promptHit && out.length === 0) prompts.push({ title: opts.source || 'Writing prompt', text: clean(text) });
 
   if (!out.length && !prompts.length) {
     warnings.push('No questions found. If this came from a scanned PDF the text layer may be missing — try pasting the text instead.');
   }
-  if (preBuf.length && !passages.length) { /* nothing worth keeping */ }
 
-  return { questions: out, passages, prompts, warnings };
+  const keys = booklet ? parseBookletKeys(raw) : {};
+  const conversion = booklet ? parseConversion(raw) : null;
+  return { questions: out, passages, prompts, warnings, keys, conversion, booklet };
 }
 
-/** Apply a key (and optional explanations) onto freshly parsed questions. */
+/** Make sure the answer letter exists as a choice (figure-only choices
+ *  sometimes lose their markers in extraction). */
+function ensureChoice(q, letter) {
+  if (q.choices.some(c => c.letter === letter)) return;
+  const set = SET_A.includes(letter) ? SET_A : SET_F;
+  const have = new Set(q.choices.map(c => c.letter));
+  const upto = Math.max(set.indexOf(letter), ...q.choices.map(c => set.indexOf(c.letter)));
+  for (let i = 0; i <= upto; i++) if (!have.has(set[i])) q.choices.push({ letter: set[i], text: '' });
+  q.choices.sort((a, b) => set.indexOf(a.letter) - set.indexOf(b.letter));
+}
+
+/** Apply a flat key (and optional explanations) onto parsed questions. */
 export function applyKey(questions, key, explanations = new Map()) {
   let hit = 0;
   for (const q of questions) {
     const letter = key.get(q.number);
-    if (letter && q.choices.some(c => c.letter === letter)) { q.answer = letter; hit++; }
+    if (letter) { ensureChoice(q, letter); q.answer = letter; hit++; }
     const ex = explanations.get(q.number);
     if (ex) q.explanation = ex;
+  }
+  return hit;
+}
+
+/** Apply per-section booklet keys; also merges the official category tags. */
+export function applyBookletKeys(questions, keys) {
+  let hit = 0;
+  for (const q of questions) {
+    const k = keys[q.subject]?.get(q.number);
+    if (!k) continue;
+    ensureChoice(q, k.answer);
+    q.answer = k.answer;
+    q.tags = [...new Set([...(k.tags || []), ...(q.tags || [])])];
+    hit++;
   }
   return hit;
 }

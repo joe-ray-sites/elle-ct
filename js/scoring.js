@@ -54,9 +54,16 @@ export function scaleToRaw(section, scale) {
   return 0;
 }
 
-export function accuracyToScale(section, accuracy) {
-  const n = ITEMS[section] || 40;
-  return rawToScale(section, Math.round(accuracy * n));
+/** `form` is an imported booklet's own conversion table ({English:[[raw,scale]…], items:{…}});
+ *  when present it beats the generic approximation. */
+export function accuracyToScale(section, accuracy, form = null) {
+  const rows = form?.[section]?.length ? form[section] : null;
+  if (rows) {
+    const raw = Math.round(accuracy * (form.items?.[section] || ITEMS[section] || 40));
+    for (const [need, score] of rows) if (raw >= need) return score;
+    return 1;
+  }
+  return rawToScale(section, Math.round(accuracy * (ITEMS[section] || 40)));
 }
 
 export const composite = (obj) => {

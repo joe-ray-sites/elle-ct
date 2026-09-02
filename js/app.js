@@ -1,7 +1,7 @@
-import * as DB from './db.js';
-import { parseTest, parseKey, parseExplanations, applyKey, parseCSV, autoTags } from './parser.js';
-import * as Coach from './coach.js';
-import * as Score from './scoring.js';
+import * as DB from './db.js?v=4';
+import { parseTest, parseKey, parseExplanations, applyKey, applyBookletKeys, parseCSV, autoTags } from './parser.js?v=4';
+import * as Coach from './coach.js?v=4';
+import * as Score from './scoring.js?v=4';
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -31,7 +31,15 @@ async function reload() {
   [S.questions, S.passages, S.prompts, S.responses, S.attempts, S.scores] = await Promise.all(
     ['questions', 'passages', 'prompts', 'responses', 'attempts', 'scores'].map(DB.all));
   S.goal = await DB.getMeta('goal', null);
+  // Conversion tables from imported booklets, keyed by source name.
+  S.forms = Object.fromEntries((await DB.all('meta')).filter(r => r.k.startsWith('conv:')).map(r => [r.k.slice(5), r.v]));
   renderCounts();
+}
+
+/** The booklet conversion table to score a section with, if exactly one imported source has one. */
+function formFor(subject) {
+  const forms = Object.values(S.forms || {}).filter(f => f?.[subject]?.length);
+  return forms.length === 1 ? forms[0] : null;
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -123,6 +131,7 @@ async function handleFiles(files) {
       if (!$('#srcName').value) $('#srcName').value = name;
       if (/\.json$/i.test(f.name)) { await importJSON(JSON.parse(await f.text())); continue; }
       if (/\.csv$/i.test(f.name)) { previewParsed(parseCSV(await f.text()).map(finishQ), []); continue; }
+      S.pendingPdf = null;
       const text = /\.pdf$/i.test(f.name) ? await pdfText(f) : await f.text();
       $('#pasteBox').value = text;
       runParse(text);
@@ -134,34 +143,67 @@ async function handleFiles(files) {
 }
 
 let pdfjs = null;
+async function loadPdfjs() {
+  if (pdfjs) return pdfjs;
+  try {
+    pdfjs = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs');
+    pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
+  } catch {
+    throw new Error('PDF reading needs an internet connection the first time. Otherwise: open the PDF, select all, and paste the text in the box below.');
+  }
+  return pdfjs;
+}
+
+/**
+ * Text of every page, each prefixed with a ⟪PAGE n⟫ marker the parser uses to
+ * remember where questions came from. Lines are rebuilt from pdf.js text
+ * items: a new line on a vertical jump or an explicit EOL, and a space wherever
+ * two items sit apart horizontally (pdf.js often omits it). The document is
+ * kept on S.pendingPdf so referenced pages can be rendered to images at save.
+ */
 async function pdfText(file) {
   toast('Reading PDF…', 8000);
-  if (!pdfjs) {
-    try {
-      pdfjs = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs');
-      pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
-    } catch {
-      throw new Error('PDF reading needs an internet connection the first time. Otherwise: open the PDF, select all, and paste the text in the box below.');
-    }
-  }
+  await loadPdfjs();
   const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
-  const out = [];
+  const parts = [];
   for (let p = 1; p <= doc.numPages; p++) {
     const page = await doc.getPage(p);
     const content = await page.getTextContent();
-    let line = '', lastY = null;
-    for (const item of content.items) {
-      const y = Math.round(item.transform[5]);
-      if (lastY !== null && Math.abs(y - lastY) > 3) { out.push(line); line = ''; }
-      line += item.str;
-      lastY = y;
+    const lines = [];
+    let line = '', lastY = null, lastEnd = null;
+    for (const it of content.items) {
+      if (typeof it.str !== 'string') continue;
+      const x = it.transform[4], y = Math.round(it.transform[5]);
+      if (lastY !== null && Math.abs(y - lastY) > 2) { lines.push(line); line = ''; lastEnd = null; }
+      if (lastEnd !== null && x - lastEnd > 1.5 && line && !/\s$/.test(line) && !/^\s/.test(it.str)) line += ' ';
+      line += it.str;
+      lastEnd = x + (it.width || 0); lastY = y;
+      if (it.hasEOL) { lines.push(line); line = ''; lastEnd = null; }
     }
-    out.push(line, '');
+    if (line) lines.push(line);
+    parts.push(`⟪PAGE ${p}⟫\n${lines.join('\n')}`);
+    if (p % 8 === 0) toast(`Reading PDF… page ${p} of ${doc.numPages}`, 4000);
   }
-  const text = out.join('\n');
-  if (text.replace(/\s/g, '').length < 200)
+  const text = parts.join('\n');
+  if (text.replace(/⟪PAGE \d+⟫/g, '').replace(/\s/g, '').length < 200)
     throw new Error('That PDF has no text layer (it is a scan). Run it through OCR, or type/paste the questions.');
+  S.pendingPdf = { doc, name: file.name };
   return text;
+}
+
+/** Render one PDF page to a JPEG data URL (~150–250 KB at this scale).
+ *  intent:'print' matters: with the default 'display' intent pdf.js paces the
+ *  render on requestAnimationFrame, which never fires in a background tab —
+ *  switch tabs during an import and every page would stall forever. */
+async function renderPdfPage(n, scale = 1.6) {
+  const page = await S.pendingPdf.doc.getPage(n);
+  const vp = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
+  const task = page.render({ canvasContext: canvas.getContext('2d'), viewport: vp, intent: 'print' });
+  const timeout = new Promise((_, rej) => setTimeout(() => { task.cancel(); rej(new Error('render timed out')); }, 30000));
+  await Promise.race([task.promise, timeout]);
+  return canvas.toDataURL('image/jpeg', 0.82);
 }
 
 function opts() {
@@ -176,15 +218,24 @@ function runParse(text) {
   if (!text.trim()) return toast('Nothing to parse — paste some text or drop a file.');
   const o = opts();
   const res = parseTest(text, o);
+  const warnings = [...res.warnings];
+
+  // Keys printed in the booklet itself come first; a pasted key fills gaps.
+  const fromBooklet = res.booklet ? applyBookletKeys(res.questions, res.keys) : 0;
   const key = parseKey($('#keyBox').value);
   const expl = parseExplanations($('#keyBox').value);
-  const hits = key.size ? applyKey(res.questions, key, expl) : 0;
-  const warnings = [...res.warnings];
-  if (res.questions.length && !hits)
+  const unkeyed = res.questions.filter(q => !q.answer);
+  const fromPaste = key.size ? applyKey(unkeyed, key, expl) : 0;
+  const keyed = fromBooklet + fromPaste;
+
+  if (fromBooklet) warnings.push(`Answer key found inside the booklet: ${fromBooklet} of ${res.questions.length} questions keyed, each tagged with its official ACT reporting category.`);
+  if (res.conversion) warnings.push('Found this form\'s raw-to-scale conversion table — score estimates for these questions will use it.');
+  if (res.questions.length && !keyed)
     warnings.push('No answer key matched these questions — paste one in the answer key box so drills can grade you. (You can also add answers later from the Library tab.)');
-  else if (hits && hits < res.questions.length)
-    warnings.push(`Answer key covered ${hits} of ${res.questions.length} questions. The rest will be shown ungraded until you fill them in.`);
-  previewParsed(res.questions, res.passages, res.prompts, warnings);
+  else if (keyed < res.questions.length)
+    warnings.push(`Answer key covered ${keyed} of ${res.questions.length} questions. The rest will be shown ungraded until you fill them in.`);
+  if (S.pendingPdf) warnings.push('Each question will keep an image of its test page, so figures, tables and equations the text loses are still there when you drill.');
+  previewParsed(res.questions, res.passages, res.prompts, warnings, { conversion: res.conversion, booklet: res.booklet });
 }
 
 function finishQ(q) {
@@ -192,20 +243,23 @@ function finishQ(q) {
   return { ...q, subject, tags: q.tags?.length ? q.tags : autoTags(q, subject) };
 }
 
-function previewParsed(questions, passages = [], prompts = [], warnings = []) {
-  S.pending = { questions, passages, prompts, opts: opts() };
+function previewParsed(questions, passages = [], prompts = [], warnings = [], extra = {}) {
+  S.pending = { questions, passages, prompts, opts: opts(), ...extra };
   const p = $('#previewPanel');
   p.classList.remove('hidden');
+  const bySubject = {};
+  for (const q of questions) bySubject[q.subject] = (bySubject[q.subject] || 0) + 1;
+  const breakdown = Object.entries(bySubject).map(([s, n]) => `${s} ${n}`).join(' · ');
   $('#previewCount').textContent =
-    `${plural(questions.length, 'question')} · ${questions.filter(q => q.answer).length} with answers · ${plural(passages.length, 'passage')}${prompts.length ? ` · ${plural(prompts.length, 'prompt')}` : ''}`;
+    `${plural(questions.length, 'question')}${breakdown ? ` (${breakdown})` : ''} · ${questions.filter(q => q.answer).length} with answers · ${plural(passages.length, 'passage')}${prompts.length ? ` · ${plural(prompts.length, 'prompt')}` : ''}`;
   $('#previewList').innerHTML =
     warnings.map(w => `<div class="pv" style="border-color:var(--warning)">⚠ ${esc(w)}</div>`).join('') +
     questions.slice(0, 40).map(q => `
       <div class="pv">
-        <div class="n">#${q.number ?? '—'} · ${esc(q.subject)}${q.tags?.length ? ' · ' + q.tags.map(esc).join(', ') : ''}</div>
+        <div class="n">#${q.number ?? '—'} · ${esc(q.subject)}${q.page ? ' · p.' + q.page : ''}${q.tags?.length ? ' · ' + q.tags.map(esc).join(', ') : ''}</div>
         <div class="st">${esc(q.stem.slice(0, 400))}</div>
         <div class="ch">${q.choices.map(c => c.letter === q.answer
-          ? `<b>${c.letter}. ${esc(c.text)} ✓</b>` : `${c.letter}. ${esc(c.text)}`).join('<br>')}</div>
+          ? `<b>${c.letter}. ${esc(c.text || '(see page)')} ✓</b>` : `${c.letter}. ${esc(c.text || '(see page)')}`).join('<br>')}</div>
       </div>`).join('') +
     (questions.length > 40 ? `<div class="pv muted">…and ${questions.length - 40} more</div>` : '');
   p.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -213,27 +267,47 @@ function previewParsed(questions, passages = [], prompts = [], warnings = []) {
 
 async function savePending() {
   if (!S.pending) return;
-  const { questions, passages, prompts, opts: o } = S.pending;
+  const { questions, passages, prompts, opts: o, conversion } = S.pending;
   const pIds = passages.map(() => DB.uid());
   await DB.putMany('passages', passages.map((p, i) => ({
-    id: pIds[i], source: o.source, label: p.label, text: p.text,
+    id: pIds[i], source: o.source, label: p.label || 'Passage', text: p.text, pages: p.pages || [],
   })));
   await DB.putMany('questions', questions.map(q => ({
     id: DB.uid(), source: o.source, subject: q.subject, number: q.number ?? null,
     stem: q.stem, choices: q.choices, answer: q.answer || null,
     explanation: q.explanation || '', tags: q.tags || [],
     passageId: q.passageIdx != null && pIds[q.passageIdx] ? pIds[q.passageIdx] : null,
+    page: q.page ?? null,
     flagged: false, createdAt: Date.now(),
     srs: { seen: 0, correct: 0, wrong: 0, box: 0, dueAt: 0, lastSeen: 0 },
   })));
   if (prompts?.length) await DB.putMany('prompts', prompts.map(p => ({
     id: DB.uid(), source: o.source, title: p.title, text: p.text, createdAt: Date.now(),
   })));
+  if (conversion) await DB.setMeta('conv:' + o.source, conversion);
+
+  // Page images: only the pages something actually references.
+  if (S.pendingPdf) {
+    const wanted = new Set();
+    questions.forEach(q => q.page && wanted.add(q.page));
+    passages.forEach(p => (p.pages || []).forEach(n => wanted.add(n)));
+    const nums = [...wanted].sort((a, b) => a - b);
+    let done = 0;
+    for (const n of nums) {
+      try {
+        const image = await renderPdfPage(n);
+        await DB.put('pages', { id: `${o.source}::${n}`, source: o.source, n, image });
+      } catch (err) { console.warn('page render failed', n, err); }
+      if (++done % 4 === 0) toast(`Saving page images… ${done} of ${nums.length}`, 3000);
+    }
+    S.pendingPdf = null;
+  }
+
   S.pending = null;
   $('#previewPanel').classList.add('hidden');
   $('#pasteBox').value = ''; $('#keyBox').value = '';
   await reload();
-  toast(`Saved ${questions.length} questions to “${o.source}”.`);
+  toast(`Saved ${plural(questions.length, 'question')} to “${o.source}”.`);
 }
 
 async function importJSON(data) {
@@ -247,9 +321,10 @@ async function importJSON(data) {
     return;
   }
   // full backup
-  for (const store of ['questions', 'passages', 'prompts', 'responses', 'attempts', 'scores']) {
+  for (const store of ['questions', 'passages', 'prompts', 'responses', 'attempts', 'scores', 'pages']) {
     if (Array.isArray(data[store])) await DB.putMany(store, data[store]);
   }
+  for (const [src, conv] of Object.entries(data.forms || {})) await DB.setMeta('conv:' + src, conv);
   if (data.goal) await DB.setMeta('goal', data.goal);
   await reload();
   toast('Backup restored.');
@@ -362,6 +437,8 @@ function bindDrill() {
   $('#flagBtn').onclick = toggleFlag;
   $('#quitBtn').onclick = endSession;
   $('#passageToggle').onclick = () => $('#qPassage').classList.toggle('collapsed');
+  $('#pageToggle').onclick = () => $('#qPageWrap').classList.toggle('collapsed');
+  $('#pageImg').onclick = (e) => e.target.classList.toggle('zoom');   // tap to zoom
   document.addEventListener('keydown', onKey);
 }
 
@@ -409,6 +486,21 @@ function showQuestion(q) {
     $('#passageToggle').textContent = `${passage.label || 'Passage'} ▾`;
     $('#passageBody').textContent = passage.text;
   } else pw.classList.add('hidden');
+
+  // The rendered test page — where the figures, tables and equations live.
+  // Opened by default for Math/Science and for any choice the text lost.
+  const pv = $('#qPageWrap');
+  const img = $('#pageImg');
+  img.removeAttribute('src'); img.classList.remove('zoom');
+  if (q.page) {
+    pv.classList.remove('hidden');
+    const open = q.subject === 'Math' || q.subject === 'Science' || q.choices.some(c => !c.text);
+    pv.classList.toggle('collapsed', !open);
+    $('#pageToggle').innerHTML = `Test page ${q.page} <span aria-hidden="true">▾</span>`;
+    DB.get('pages', `${q.source}::${q.page}`).then(row => {
+      if (row && S.drill && S.drill.queue[S.drill.i] === q) img.src = row.image;
+    });
+  } else pv.classList.add('hidden');
 
   $('#qStem').textContent = q.stem;
   $('#qChoices').innerHTML = q.choices.map(c =>
@@ -604,7 +696,7 @@ function endSession() {
     <div class="stat-cards">
       <div class="card ${pct >= 75 ? 'good' : 'bad'}"><div class="k">Accuracy</div><div class="v">${pct}%</div></div>
       <div class="card"><div class="k">Missed</div><div class="v">${missed.length}</div></div>
-      <div class="card"><div class="k">Estimated scale</div><div class="v">${done.length ? Score.accuracyToScale(missed[0]?.q.subject || d.queue[0].subject, right / done.length) : '—'}</div><div class="d">rough, untimed</div></div>
+      <div class="card"><div class="k">Estimated scale</div><div class="v">${done.length ? Score.accuracyToScale(missed[0]?.q.subject || d.queue[0].subject, right / done.length, formFor(missed[0]?.q.subject || d.queue[0].subject)) : '—'}</div><div class="d">rough, untimed</div></div>
     </div>
     ${worstTags.length ? `<p class="sub">Weak in this set: ${worstTags.map(([t, n]) => `<b>${esc(t)}</b> (${n} missed)`).join(', ')}</p>` : ''}
     ${tips.map(t => `<div class="explanation tip"><span class="lbl">Tip</span><strong>${esc(t.b)}</strong> — ${esc(t.x)}</div>`).join('')}
@@ -731,6 +823,8 @@ async function exportBackup() {
     exportedAt: new Date().toISOString(),
     questions: S.questions, passages: S.passages, prompts: S.prompts,
     responses: S.responses, attempts: S.attempts, scores: S.scores, goal: S.goal,
+    pages: await DB.all('pages'),
+    forms: S.forms,
   };
   const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
   const a = document.createElement('a');
@@ -895,7 +989,7 @@ function estimates() {
     if (rows.length < 8) continue;
     const recent = rows.sort((a, b) => b.at - a.at).slice(0, 120);
     const acc = recent.filter(r => r.correct).length / recent.length;
-    out[s] = { scale: Score.accuracyToScale(s, acc), acc, n: recent.length };
+    out[s] = { scale: Score.accuracyToScale(s, acc, formFor(s)), acc, n: recent.length };
   }
   return out;
 }
@@ -987,7 +1081,7 @@ function renderStats() {
       <span class="nm">${s}</span>
       <div class="track"><div class="fill" style="width:${(a * 100).toFixed(1)}%"></div>
       ${target ? `<div class="marker" style="left:${(Score.scaleToRaw(s, target) / Score.ITEMS[s] * 100).toFixed(1)}%"></div>` : ''}</div>
-      <span class="val">${Math.round(a * 100)}% · ~${Score.accuracyToScale(s, a)}</span>
+      <span class="val">${Math.round(a * 100)}% · ~${Score.accuracyToScale(s, a, formFor(s))}</span>
       <span class="muted">${rows.length}q</span>
     </div>`;
   }).join('') + (g.composite ? '<p class="hint">Marker = the accuracy you need for your target score in that section.</p>' : '');

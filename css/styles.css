@@ -294,6 +294,15 @@ button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--dan
                 overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 .passage.collapsed .passage-body { display: none; }
 
+/* rendered test page — figures, tables and equations the text extraction loses */
+.pageview { background: var(--surface-in); border: 1px solid var(--border);
+            border-radius: var(--r-md); margin-bottom: var(--s-4); overflow: hidden; }
+.pageview.collapsed .pageview-body { display: none; }
+.pageview-body { max-height: 70vh; overflow: auto; -webkit-overflow-scrolling: touch;
+                 overscroll-behavior: contain; background: #fff; }
+.pageview-body img { display: block; width: 100%; height: auto; cursor: zoom-in; }
+.pageview-body img.zoom { width: 190%; max-width: none; cursor: zoom-out; }
+
 .stem { font-size: var(--fs-lg); line-height: var(--lh-snug); white-space: pre-wrap;
         margin-bottom: var(--s-5); letter-spacing: -.01em; }
 

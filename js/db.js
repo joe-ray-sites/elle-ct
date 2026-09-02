@@ -1,6 +1,6 @@
 // Tiny IndexedDB wrapper. Everything lives on this machine; nothing is uploaded.
 const DB_NAME = 'elle-act';
-const DB_VER = 1;
+const DB_VER = 2;                       // v2: pages store (rendered PDF pages)
 const STORES = {
   questions: { keyPath: 'id', indexes: ['subject', 'source'] },
   passages:  { keyPath: 'id', indexes: ['source'] },
@@ -8,6 +8,7 @@ const STORES = {
   responses: { keyPath: 'id', indexes: ['promptId'] },
   attempts:  { keyPath: 'id', indexes: ['questionId', 'day'] },
   scores:    { keyPath: 'id', indexes: ['date'] },
+  pages:     { keyPath: 'id', indexes: ['source'] },   // `${source}::${n}` → JPEG data URL
   meta:      { keyPath: 'k' },
 };
 

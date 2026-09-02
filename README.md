@@ -6,7 +6,7 @@ you what you got wrong and why, and tracks how far you are from your goal score.
 
 Everything lives in your browser's storage on this machine. Nothing is uploaded.
 
-**Live:** https://josephray26-ai.github.io/elle-ct/
+**Live:** https://joe-ray-sites.github.io/elle-ct/
 
 ## Running it locally
 
@@ -26,10 +26,11 @@ files directly and never runs it.
 ## Deploying
 
 Pushing to `main` publishes to GitHub Pages automatically; a build takes about
-a minute. GitHub Pages serves CSS and JS with a ~10 minute cache, so **when you
-change a stylesheet, bump the `?v=` on the `<link>` tags** in `index.html` and
-`app.html` — otherwise returning visitors keep the old CSS until the cache
-expires. `.nojekyll` is there so Pages serves the files as-is rather than
+a minute. GitHub Pages serves CSS and JS with a ~10 minute cache, and browsers
+can hold ES modules even longer, so **when you change CSS or JS, bump the
+`?v=` everywhere** — the `<link>` and `<script>` tags in `index.html` and
+`app.html`, and the `import … from './x.js?v=N'` specifiers inside `js/`.
+Otherwise returning visitors run a mix of old and new modules. `.nojekyll` is there so Pages serves the files as-is rather than
 running them through Jekyll.
 
 ## The mark
@@ -95,6 +96,20 @@ choices, and any passages above them. Paste the answer key separately (any
 format — `1. A  2. J  3. C` works) and it maps onto the questions by number. If
 the source has written explanations (`12. The correct answer is F because…`)
 those get attached too. Preview before saving, fix anything later from Library.
+
+Real ACT booklets — including the *My Answer Key* booklet ACT sends after a
+test — import in one drop. The importer reads the section headers (ENGLISH
+TEST, MATHEMATICS TEST …) so every question lands in the right section with
+per-section numbering; finds the scoring keys printed at the back and applies
+them, tagging every question with its official ACT reporting category
+(`conventions-of-standard-english`, `functions`, `interpretation-of-data` …);
+and reads the form's own raw-to-scale conversion table, which then drives the
+score estimates for those questions instead of the generic approximation.
+
+Text extraction can't carry figures, tables, or equations, so every question
+also keeps an image of the page it came from. In a drill, Math and Science
+questions open with the page shown; other sections keep it a tap away. Tap the
+page to zoom. The images live in the browser database like everything else.
 
 Scanned PDFs with no text layer can't be read — the app tells you so rather
 than silently importing nothing.

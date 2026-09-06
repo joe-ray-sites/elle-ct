@@ -141,6 +141,42 @@ export function parseBookletKeys(text) {
 }
 
 /**
+ * ACT's "My Answer Key Report": per section, a CORRECT ANSWERS row of letters
+ * like "BHDFCFDFAJ BFDJC^^^^^ …". A caret is a field-test item that was not
+ * scored and is absent from the booklet, so the scored letters number
+ * sequentially with carets skipped — the same numbering the booklet uses.
+ * Only the CORRECT ANSWERS row is read; a YOUR ANSWERS row is ignored.
+ * Returns { English: Map(number → {answer, tags:[]}), … } when sections are
+ * labelled, or { '*': Map } for a bare CORRECT ANSWERS line.
+ */
+export function parseReportKeys(text) {
+  if (!text || !/correct answers?\s*:/i.test(text)) return {};
+  const out = {};
+  const lines = text.replace(/\r/g, '').split('\n');
+  let section = '*';
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i].match(/^\s*(ENGLISH|MATHEMATICS|MATH|READING|SCIENCE)\b\s*:?\s*$/i);
+    if (head) { section = SUBJECT_OF[head[1].toUpperCase()]; continue; }
+    const m = lines[i].match(/correct answers?\s*:\s*(.*)$/i);
+    if (!m) continue;
+    // the letter row may sit on the same line or on the next non-empty one
+    let row = m[1].trim();
+    if (!/[A-K]/.test(row)) row = (lines.slice(i + 1).find(l => l.trim()) || '').trim();
+    const letters = row.replace(/[^A-K^*\-]/gi, '').toUpperCase();
+    if (letters.replace(/[^A-K]/g, '').length < 5) continue;
+    const map = new Map();
+    let n = 0;
+    for (const ch of letters) {
+      if (ch === '^') continue;                              // field-test item, not in the booklet
+      n++;
+      if (/[A-K]/.test(ch) && ch !== 'I') map.set(n, { answer: ch, tags: [] });
+    }
+    if (map.size) out[section] = map;
+  }
+  return out;
+}
+
+/**
  * The form-specific "Conversion of Raw Scores to Scale Scores" table: five
  * tokens per row — scale, then raw (or range, or —) for E / M / R / S.
  * Returns { English: [[rawNeeded, scale] …], …, items: {English: 40, …} }.

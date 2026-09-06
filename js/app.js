@@ -1,7 +1,7 @@
-import * as DB from './db.js?v=4';
-import { parseTest, parseKey, parseExplanations, applyKey, applyBookletKeys, parseCSV, autoTags } from './parser.js?v=4';
-import * as Coach from './coach.js?v=4';
-import * as Score from './scoring.js?v=4';
+import * as DB from './db.js?v=5';
+import { parseTest, parseKey, parseExplanations, applyKey, applyBookletKeys, parseReportKeys, parseCSV, autoTags } from './parser.js?v=5';
+import * as Coach from './coach.js?v=5';
+import * as Score from './scoring.js?v=5';
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -133,6 +133,14 @@ async function handleFiles(files) {
       if (/\.csv$/i.test(f.name)) { previewParsed(parseCSV(await f.text()).map(finishQ), []); continue; }
       S.pendingPdf = null;
       const text = /\.pdf$/i.test(f.name) ? await pdfText(f) : await f.text();
+      // An answer-key report has no questions in it — it belongs in the key box.
+      if (/correct answers?\s*:/i.test(text) && !/^\s{0,8}\(?[A-K]\s*[.):]\s*\S/m.test(text)) {
+        $('#keyBox').value = text;
+        S.pendingPdf = null;
+        toast('Loaded an answer key report into the key box. Now drop or paste the test itself.', 5000);
+        if ($('#pasteBox').value.trim()) runParse($('#pasteBox').value);
+        continue;
+      }
       $('#pasteBox').value = text;
       runParse(text);
     } catch (err) {
@@ -222,11 +230,21 @@ function runParse(text) {
 
   // Keys printed in the booklet itself come first; a pasted key fills gaps.
   const fromBooklet = res.booklet ? applyBookletKeys(res.questions, res.keys) : 0;
-  const key = parseKey($('#keyBox').value);
-  const expl = parseExplanations($('#keyBox').value);
-  const unkeyed = res.questions.filter(q => !q.answer);
-  const fromPaste = key.size ? applyKey(unkeyed, key, expl) : 0;
+  const pasted = $('#keyBox').value;
+  const report = parseReportKeys(pasted);
+  let fromPaste = 0;
+  if (report['*'] && !res.booklet) {
+    // a bare CORRECT ANSWERS row: flat numbering
+    fromPaste = applyKey(res.questions.filter(q => !q.answer), new Map([...report['*']].map(([n, v]) => [n, v.answer])));
+  } else if (Object.keys(report).length) {
+    fromPaste = applyBookletKeys(res.questions.filter(q => !q.answer), report);
+  } else {
+    const key = parseKey(pasted);
+    const expl = parseExplanations(pasted);
+    fromPaste = key.size ? applyKey(res.questions.filter(q => !q.answer), key, expl) : 0;
+  }
   const keyed = fromBooklet + fromPaste;
+  if (fromPaste && Object.keys(report).length) warnings.push(`Applied the answer key report: ${fromPaste} questions keyed from its CORRECT ANSWERS rows (field-test items skipped).`);
 
   if (fromBooklet) warnings.push(`Answer key found inside the booklet: ${fromBooklet} of ${res.questions.length} questions keyed, each tagged with its official ACT reporting category.`);
   if (res.conversion) warnings.push('Found this form\'s raw-to-scale conversion table — score estimates for these questions will use it.');
@@ -1054,6 +1072,53 @@ function renderGoals() {
 }
 
 // =============================================================== STATS
+/**
+ * One card per imported test. Scores the FIRST attempt at each question —
+ * that is the honest "how did I do", re-tries are practice — and converts
+ * with the form's own raw→scale table when the booklet supplied one.
+ */
+function renderTestReports() {
+  const box = $('#testReports');
+  const first = new Map();
+  for (const a of [...S.attempts].sort((x, y) => x.at - y.at)) {
+    if (a.skipped || !a.chosen || first.has(a.questionId)) continue;
+    first.set(a.questionId, a);
+  }
+  const sources = [...new Set(S.questions.map(q => q.source))]
+    .filter(src => S.questions.filter(q => q.source === src && q.answer).length >= 10);
+  if (!sources.length) { box.innerHTML = '<p class="muted">Import a full test and drill it — a report per test appears here.</p>'; return; }
+
+  box.innerHTML = sources.map(src => {
+    const form = S.forms?.[src] || null;
+    const rows = Score.SECTIONS.map(sec => {
+      const qs = S.questions.filter(q => q.source === src && q.subject === sec && q.answer);
+      if (!qs.length) return null;
+      const done = qs.filter(q => first.has(q.id));
+      const right = done.filter(q => first.get(q.id).correct).length;
+      const scale = done.length ? Score.accuracyToScale(sec, right / done.length, form) : null;
+      return { sec, n: qs.length, done: done.length, right, scale };
+    }).filter(Boolean);
+    const scales = rows.map(r => r.scale).filter(v => v != null);
+    const composite = scales.length ? Math.round(scales.reduce((a, b) => a + b, 0) / scales.length) : null;
+    const attempted = rows.reduce((a, r) => a + r.done, 0), total = rows.reduce((a, r) => a + r.n, 0);
+    return `
+      <div class="li">
+        <div class="li-head">
+          <div class="li-title"><strong>${esc(src)}</strong><br>
+            <span class="muted">${attempted} of ${total} questions attempted${form ? ' · scored with this form\'s conversion table' : ' · generic conversion'}</span></div>
+          <div class="card" style="padding:8px 14px;text-align:center"><div class="k">Composite</div><div class="v">${composite ?? '—'}</div></div>
+        </div>
+        ${rows.map(r => `
+          <div class="bar">
+            <span class="nm">${r.sec}</span>
+            <div class="track"><div class="fill" style="width:${r.done ? (100 * r.right / r.done).toFixed(1) : 0}%"></div></div>
+            <span class="val">${r.done ? `${r.right}/${r.done}` : '—'} of ${r.n}<em>${r.scale != null ? '≈ ' + r.scale : 'not started'}</em></span>
+          </div>`).join('')}
+        ${attempted < total ? `<p class="hint" style="margin-top:8px">Section scores are projected from the questions attempted so far; they settle once every question has been seen once.</p>` : ''}
+      </div>`;
+  }).join('');
+}
+
 function renderStats() {
   const graded = S.attempts.filter(a => !a.skipped && a.chosen);
   const acc = graded.length ? graded.filter(a => a.correct).length / graded.length : 0;
@@ -1085,6 +1150,8 @@ function renderStats() {
       <span class="muted">${rows.length}q</span>
     </div>`;
   }).join('') + (g.composite ? '<p class="hint">Marker = the accuracy you need for your target score in that section.</p>' : '');
+
+  renderTestReports();
 
   const byQ = new Map();
   for (const a of graded) {

@@ -30,7 +30,8 @@ a minute. GitHub Pages serves CSS and JS with a ~10 minute cache, and browsers
 can hold ES modules even longer, so **when you change CSS or JS, bump the
 `?v=` everywhere** — the `<link>` and `<script>` tags in `index.html` and
 `app.html`, and the `import … from './x.js?v=N'` specifiers inside `js/`.
-Otherwise returning visitors run a mix of old and new modules. `.nojekyll` is there so Pages serves the files as-is rather than
+Otherwise returning visitors run a mix of old and new modules.
+`.nojekyll` is there so Pages serves the files as-is rather than
 running them through Jekyll.
 
 ## The mark
@@ -105,6 +106,18 @@ them, tagging every question with its official ACT reporting category
 (`conventions-of-standard-english`, `functions`, `interpretation-of-data` …);
 and reads the form's own raw-to-scale conversion table, which then drives the
 score estimates for those questions instead of the generic approximation.
+
+ACT's *My Answer Key Report* (the sheet with CORRECT ANSWERS / YOUR ANSWERS
+rows per section) works as a key too: paste it into the answer-key box, or
+drop it as a file and it lands there automatically. Only the CORRECT ANSWERS
+rows are read; a `^` marks a field-test item that was not scored and is not in
+the booklet, so scored letters are numbered with carets skipped — the same
+numbering the booklet uses. That makes the report a drop-in key for a booklet
+whose scoring pages are missing.
+
+After drilling an imported test, the Stats tab shows a report per test: the
+first attempt at every question, scored per section and converted with that
+form's own table into scale scores and a composite.
 
 Text extraction can't carry figures, tables, or equations, so every question
 also keeps an image of the page it came from. In a drill, Math and Science

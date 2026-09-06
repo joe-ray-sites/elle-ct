@@ -1146,8 +1146,7 @@ function renderStats() {
       <span class="nm">${s}</span>
       <div class="track"><div class="fill" style="width:${(a * 100).toFixed(1)}%"></div>
       ${target ? `<div class="marker" style="left:${(Score.scaleToRaw(s, target) / Score.ITEMS[s] * 100).toFixed(1)}%"></div>` : ''}</div>
-      <span class="val">${Math.round(a * 100)}% · ~${Score.accuracyToScale(s, a, formFor(s))}</span>
-      <span class="muted">${rows.length}q</span>
+      <span class="val">${Math.round(a * 100)}% · ~${Score.accuracyToScale(s, a, formFor(s))}<em>${rows.length} answered</em></span>
     </div>`;
   }).join('') + (g.composite ? '<p class="hint">Marker = the accuracy you need for your target score in that section.</p>' : '');
 

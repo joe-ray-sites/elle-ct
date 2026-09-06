@@ -1,7 +1,8 @@
-import * as DB from './db.js?v=5';
-import { parseTest, parseKey, parseExplanations, applyKey, applyBookletKeys, parseReportKeys, parseCSV, autoTags } from './parser.js?v=5';
-import * as Coach from './coach.js?v=5';
-import * as Score from './scoring.js?v=5';
+import * as DB from './db.js?v=7';
+import { parseTest, parseKey, parseExplanations, applyKey, applyBookletKeys, parseReportKeys, parseCSV, autoTags } from './parser.js?v=7';
+import * as Coach from './coach.js?v=7';
+import * as Score from './scoring.js?v=7';
+import { STARTER, STARTER_SOURCE } from './starter.js?v=7';
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -17,6 +18,8 @@ const S = {
 // ------------------------------------------------------------- boot
 async function boot() {
   await reload();
+  // Empty library? Load the built-in practice set so the app works immediately.
+  if (!S.questions.length) { await loadStarter(); await reload(); }
   bindNav();
   bindImport();
   bindDrill();
@@ -43,6 +46,23 @@ function formFor(subject) {
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** Insert the bundled starter test (original questions) unless it is already there. */
+async function loadStarter() {
+  if (S.questions.some(q => q.source === STARTER_SOURCE)) return 0;
+  const pid = Object.fromEntries(STARTER.passages.map(p => [p.key, DB.uid()]));
+  await DB.putMany('passages', STARTER.passages.map(p => ({
+    id: pid[p.key], source: STARTER_SOURCE, label: p.label, text: p.text, pages: [],
+  })));
+  await DB.putMany('questions', STARTER.questions.map(q => ({
+    id: DB.uid(), source: STARTER_SOURCE, subject: q.subject, number: q.number,
+    stem: q.stem, choices: q.choices, answer: q.answer, explanation: q.explanation,
+    tags: q.tags, passageId: q.passage ? pid[q.passage] : null, page: null,
+    flagged: false, createdAt: Date.now(),
+    srs: { seen: 0, correct: 0, wrong: 0, box: 0, dueAt: 0, lastSeen: 0 },
+  })));
+  return STARTER.questions.length;
+}
 
 function renderCounts() {
   const withKey = S.questions.filter(q => q.answer).length;
@@ -91,6 +111,13 @@ function bindTheme() {
 }
 
 function show(view) {
+  if (view === 'drill') {            // landing page's "Start a drill": no setup screen
+    show('study');
+    S.filters.subjects.clear(); S.filters.sources.clear(); S.filters.tags.clear();
+    $('#modeSel').value = 'smart'; $('#lenSel').value = '10';
+    if (S.questions.length) startDrill();
+    return;
+  }
   if (!$('#view-' + view)) view = 'study';
   $$('.view').forEach(v => v.classList.add('hidden'));
   $('#view-' + view).classList.remove('hidden');
@@ -373,7 +400,11 @@ function renderStudySetup() {
   const subjects = [...new Set(S.questions.map(q => q.subject))].sort();
   $('#subjChips').innerHTML = subjects.length
     ? subjects.map(s => chip(s, S.filters.subjects.has(s), count(q => q.subject === s))).join('')
-    : '<span class="muted">Nothing imported yet — head to the Import tab.</span>';
+    : `<span class="muted">The library is empty.</span>
+       <button class="ghost" id="loadStarterBtn" style="min-height:40px">Load the built-in practice test</button>`;
+  $('#loadStarterBtn')?.addEventListener('click', async () => {
+    await loadStarter(); await reload(); renderStudySetup(); toast('Practice test loaded.');
+  });
 
   const sources = [...new Set(S.questions.map(q => q.source))].sort();
   $('#sourceChips').innerHTML = sources.map(s => chip(s, S.filters.sources.has(s), count(q => q.source === s))).join('') || '<span class="muted">—</span>';
@@ -383,7 +414,7 @@ function renderStudySetup() {
   const tags = Object.keys(tagCounts).sort((a, b) => tagCounts[b] - tagCounts[a]).slice(0, 24);
   $('#tagChips').innerHTML = tags.map(t => chip(t, S.filters.tags.has(t), tagCounts[t])).join('') || '<span class="muted">—</span>';
 
-  const wire = (el, set) => $$('.chip', el).forEach(c => c.onclick = () => {
+  const wire = (el, set) => $$('.chip[data-v]', el).forEach(c => c.onclick = () => {
     const v = c.dataset.v;
     set.has(v) ? set.delete(v) : set.add(v);
     renderStudySetup();
@@ -643,7 +674,7 @@ async function explain(forceAI) {
 
   if (q.explanation && !forceAI) {
     box.classList.remove('tip');
-    box.innerHTML = `<span class="lbl">Explanation (from your material)</span>${esc(q.explanation)}`;
+    box.innerHTML = `<span class="lbl">${q.source === STARTER_SOURCE ? 'Explanation' : 'Explanation (from your material)'}</span>${esc(q.explanation)}`;
     ensureVisible(box);
     return;
   }

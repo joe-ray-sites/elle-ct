@@ -89,6 +89,19 @@ note, and a closing CTA. Content reveals on scroll with an observer that fires
 a screen early and a timeout that reveals everything regardless — a blank card
 is worse than an un-animated one.
 
+## The built-in practice test
+
+The app opens usable: an empty library is seeded with a starter test of
+original ACT-style questions (`js/starter.js` — 8 English on a passage, 10
+Math, 7 Reading on a passage, 7 Science on a two-experiment data passage), each
+with a key, an explanation, and reporting-category tags. The landing page's
+*Start a drill* goes to `app.html#drill`, which skips the setup screen and
+starts a ten-question smart-mix drill immediately. Delete everything from the
+Library and the Study tab offers to load the starter again.
+
+Every question in it was written for ElleCT. Real ACT booklets are ACT's
+copyrighted material and are never bundled — you import your own.
+
 ## The tabs
 
 **Import** — drop in a PDF, a `.txt`, a `.csv`, or paste text straight from an
